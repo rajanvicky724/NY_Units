@@ -1,34 +1,12 @@
 import streamlit as st
 import pandas as pd
 import requests
-import time
-import urllib3
 import io
-import random
-
-# Disable SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- CONFIGURATION ---
-# We use a session to maintain cookies (makes us look like a real browser)
-session = requests.Session()
-
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Referer': 'https://propertyinformationportal.nyc.gov/parcels/',
-    'Origin': 'https://propertyinformationportal.nyc.gov',
-    'Connection': 'keep-alive',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin',
-    'Pragma': 'no-cache',
-    'Cache-Control': 'no-cache'
-}
-
-# Apply headers to the session
-session.headers.update(HEADERS)
+# NYC Open Data PLUTO Dataset API Endpoint
+# This is the official API for NYC property data
+API_URL = "https://data.cityofnewyork.us/resource/64uk-42ks.json"
 
 def clean_bbl(value):
     """
@@ -38,104 +16,109 @@ def clean_bbl(value):
     clean = "".join(filter(str.isdigit, s))
     return clean
 
-def get_unit_count(bbl):
+def fetch_units_batch(bbl_list):
     """
-    Fetches unit count using a persistent session.
+    Fetches data for MANY BBLs at once using SoQL (SQL for APIs).
+    This is much faster and cleaner than scraping.
     """
-    url = f"https://propertyinformationportal.nyc.gov/parcels/api/parcels/{bbl}/overview"
+    # Convert list of BBLs to a string for the query: '1001990025','1001990026',...
+    bbl_string = ",".join([f"'{bbl}'" for bbl in bbl_list])
     
-    # Retry logic (tries 3 times before failing)
-    for attempt in range(3):
-        try:
-            # We add a random parameter to prevent caching issues
-            response = session.get(url, verify=False, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                overview = data.get('parcelOverview', {})
-                total = overview.get('numberOfTotalUnits')
-                res = overview.get('numberOfResidentialUnits')
-                val = total if total is not None else res
-                return val if val is not None else 0
-                
-            elif response.status_code == 404:
-                return "Invalid BBL"
-            
-            elif response.status_code == 403:
-                # If blocked (403), wait longer and try again
-                time.sleep(2)
-                continue
-                
-        except Exception as e:
-            # Wait and retry on connection error
-            time.sleep(1)
-            continue
-            
-    return "Connection Error"
+    # We query where BBL is in our list
+    # We ask for fields: bbl, unitsres (residential), unitstotal (total)
+    params = {
+        "$select": "bbl, unitsres, unitstotal",
+        "$where": f"bbl in({bbl_string})",
+        "$limit": 50000  # Max limit per call
+    }
+    
+    try:
+        response = requests.get(API_URL, params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"API Error: {response.status_code}")
+            return []
+    except Exception as e:
+        st.error(f"Connection Failed: {e}")
+        return []
 
 # --- STREAMLIT UI ---
-st.set_page_config(page_title="NYC Unit Scraper", layout="wide")
-st.title("🏙️ NYC Property Unit Scraper (Enhanced)")
+st.set_page_config(page_title="NYC Unit Lookup", layout="wide")
+st.title("🏙️ NYC Unit Lookup (via Open Data)")
+st.markdown("This tool checks the **NYC PLUTO Database** (Open Data) instead of scraping.")
 
 uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx", "xls"])
 
 if uploaded_file is not None:
     try:
         df = pd.read_excel(uploaded_file)
-        st.success("File uploaded!")
         
-        # Select Column
         cols = df.columns.tolist()
         default_idx = cols.index('Parcel_Number') if 'Parcel_Number' in cols else 0
         target_col = st.selectbox("Select BBL Column", cols, index=default_idx)
 
-        if st.button("Start Scraping"):
-            results = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            total_rows = len(df)
-            
-            # Initial request to "wake up" the session cookies
-            try:
-                session.get("https://propertyinformationportal.nyc.gov/parcels/", verify=False)
-            except:
-                pass
-
-            for index, row in df.iterrows():
-                progress = (index + 1) / total_rows
-                progress_bar.progress(progress)
+        if st.button("Get Units"):
+            with st.spinner("Processing..."):
+                # 1. Prepare BBLs
+                df['Clean_BBL'] = df[target_col].apply(clean_bbl)
+                all_bbls = df['Clean_BBL'].unique().tolist()
                 
-                raw_bbl = row[target_col]
-                bbl = clean_bbl(raw_bbl)
+                # 2. Batch Request (Chunks of 200 to avoid URL length limits)
+                # PLUTO API works best when we ask for chunks of data
+                chunk_size = 200
+                api_results = []
                 
-                status_text.text(f"Processing {index + 1}/{total_rows}: {bbl}")
+                progress_bar = st.progress(0)
                 
-                if len(bbl) < 9:
-                    units = "Invalid Format"
+                for i in range(0, len(all_bbls), chunk_size):
+                    chunk = all_bbls[i:i + chunk_size]
+                    data = fetch_units_batch(chunk)
+                    api_results.extend(data)
+                    
+                    # Update progress
+                    progress_bar.progress(min((i + chunk_size) / len(all_bbls), 1.0))
+                
+                # 3. Convert API data to DataFrame
+                # The API returns lowercase keys: 'bbl', 'unitsres', 'unitstotal'
+                lookup_df = pd.DataFrame(api_results)
+                
+                if not lookup_df.empty:
+                    # Ensure BBL is string for matching
+                    lookup_df['bbl'] = lookup_df['bbl'].astype(str)
+                    
+                    # Rename columns for clarity
+                    lookup_df = lookup_df.rename(columns={
+                        'bbl': 'Clean_BBL',
+                        'unitstotal': 'Total_Units',
+                        'unitsres': 'Res_Units'
+                    })
+                    
+                    # 4. Merge with original data
+                    final_df = pd.merge(df, lookup_df[['Clean_BBL', 'Total_Units', 'Res_Units']], 
+                                      on='Clean_BBL', 
+                                      how='left')
+                    
+                    # Fill missing values (Not Found in PLUTO)
+                    final_df['Total_Units'] = final_df['Total_Units'].fillna("Not Found")
                 else:
-                    units = get_unit_count(bbl)
-                
-                row_data = row.to_dict()
-                row_data['Clean_BBL'] = bbl
-                row_data['Total_Units'] = units
-                results.append(row_data)
-                
-                # Random delay between 0.5s and 1.5s to look human
-                time.sleep(random.uniform(0.5, 1.5))
+                    final_df = df.copy()
+                    final_df['Total_Units'] = "No Data"
+
+            st.success("Done!")
             
-            status_text.text("Done!")
-            result_df = pd.DataFrame(results)
-            st.write("### Preview Results")
-            st.dataframe(result_df.head())
+            st.write("### Results Preview")
+            st.dataframe(final_df.head())
             
+            # Download
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                result_df.to_excel(writer, index=False)
+                final_df.to_excel(writer, index=False)
             
             st.download_button(
-                label="📥 Download Results",
+                label="📥 Download Excel",
                 data=output.getvalue(),
-                file_name="NYC_Units_Scraped.xlsx",
+                file_name="NYC_PLUTO_Units.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
